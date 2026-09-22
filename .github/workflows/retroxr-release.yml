@@ -151,8 +151,10 @@ jobs:
 
   # The oldest Ubuntu runner: a shared library loads only against a glibc at
   # least as new as the one it was linked with. The core links libgcc and
-  # libstdc++ statically (Source/ui_libretro/CMakeLists.txt) and needs only
-  # libGL and zlib besides libc. glew includes GL/glu.h, so GLU headers too.
+  # libstdc++ statically (Source/ui_libretro/CMakeLists.txt). What it still
+  # takes from the system, measured: libGL.so.1, libz.so.1, libcrypto.so.3
+  # (OpenSSL 3) and libbz2.so.1.0 -- the Debian soname, which Arch also
+  # provides and Fedora does not. glew.h includes GL/glu.h, hence GLU.
   linux:
     name: Linux x86_64
     runs-on: ubuntu-22.04
