@@ -1,0 +1,310 @@
+# Build the retroXR Play! (PlayStation 2) libretro core for Windows, Android,
+# Linux and macOS and publish it as a release, so retroXR's CoreDownloadManager
+# can fetch it.
+#
+# This fork carries three fixes over upstream, all of which retroXR needs:
+#
+#   - The data directory. Upstream uses getenv("EXTERNAL_STORAGE") on Android,
+#     /sdcard, where an app without MANAGE_EXTERNAL_STORAGE cannot create a
+#     directory under scoped storage; the std::filesystem_error escaped
+#     retro_init and aborted the frontend. The core now asks the frontend for
+#     its save, then system directory, and retro_init lets no exception out.
+#   - A null JavaVM. CJavaVM::AttachCurrentThread (deps/Framework, RetroXR's
+#     branch of Play--Framework) dereferenced a VM that only ui_android's
+#     JNI_OnLoad ever sets, which a core the frontend dlopens never gets.
+#     Attach and detach are now no-ops without a VM.
+#   - Seams down the picture. Prim_Sprite snaps its quad to whole pixels, so
+#     the last column of each 64-pixel framebuffer strip is drawn.
+#
+# The Android fixes live partly in deps/Framework, which is why every checkout
+# is recursive: without the submodules there is nothing to build, and with
+# upstream's Framework the core would crash on a Quest.
+#
+#   Windows  play_libretro.dll.zip             containing play_libretro.dll
+#   Android  play_libretro_android.so.zip      containing play_libretro_android.so
+#   Linux    play_libretro.so.zip              containing play_libretro.so
+#   macOS    play_libretro_arm64.dylib.zip
+#            play_libretro_x86_64.dylib.zip
+#              each containing play_libretro.dylib
+#
+# Every job configures with BUILD_PLAY=off and builds only the play_libretro
+# target, which is how retroxr-play-libretro-v1 was built by hand: no Qt, no
+# Vulkan SDK and no OpenAL are needed for the core, whose only renderer is GL.
+#
+# The release must NOT be a prerelease: the download URL is the /releases/latest/
+# form so shipping a build needs no app update, and GitHub's `latest` skips
+# prereleases. Anything else cut on this fork should be marked prerelease.
+name: retroXR core release
+
+on:
+  push:
+    tags:
+      - 'retroxr-play-libretro-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build'
+        required: true
+        default: 'retroxr'
+      tag:
+        description: 'Release tag to publish as (leave blank to build without publishing)'
+        required: false
+        default: ''
+
+jobs:
+  # MSVC through Ninja, as v1 was built. Like v1's, the DLL imports the
+  # dynamic CRT (MSVCP140, VCRUNTIME140).
+  windows:
+    name: Windows x86_64 (MSVC)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off
+          cmake --build build --target play_libretro
+
+      - name: Package
+        shell: bash
+        run: |
+          mapfile -t hits < <(find build -name 'play_libretro.dll' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one play_libretro.dll, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage
+          cp "${hits[0]}" stage/play_libretro.dll
+          (cd stage && 7z a -tzip ../play_libretro.dll.zip play_libretro.dll > /dev/null)
+          ls -l stage play_libretro.dll.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: play_libretro.dll.zip
+          if-no-files-found: error
+
+  # arm64-v8a only, the one ABI retroXR ships, with the flags
+  # build_retro/android_build.sh passes (c++_static, clang, Release).
+  android:
+    name: Android arm64-v8a
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build unzip zip
+          # Into RUNNER_TEMP, NOT the workspace: checkout clears the workspace.
+          wget -q -O "$RUNNER_TEMP/ndk.zip" https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK=$RUNNER_TEMP/android-ndk-r27d" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_NDK="$ANDROID_NDK" -DANDROID_ABI=arm64-v8a \
+            -DANDROID_NATIVE_API_LEVEL=21 -DANDROID_STL=c++_static \
+            -DANDROID_TOOLCHAIN=clang
+          cmake --build build --target play_libretro
+
+      # CMake names it play_libretro_android.so (a SUFFIX set for Android),
+      # which is already the asset's name. Stripped, as android_build.sh does.
+      - name: Package
+        run: |
+          mapfile -t hits < <(find build -name 'play_libretro_android.so' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one play_libretro_android.so, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage
+          "$ANDROID_NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-all \
+            -o stage/play_libretro_android.so "${hits[0]}"
+          (cd stage && zip -q -X ../play_libretro_android.so.zip play_libretro_android.so)
+          file stage/play_libretro_android.so
+          ls -lh play_libretro_android.so.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: play_libretro_android.so.zip
+          if-no-files-found: error
+
+  # The oldest Ubuntu runner: a shared library loads only against a glibc at
+  # least as new as the one it was linked with. The core links libgcc and
+  # libstdc++ statically (Source/ui_libretro/CMakeLists.txt) and needs only
+  # libGL and zlib besides libc.
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zip libgl-dev zlib1g-dev
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off
+          cmake --build build --target play_libretro
+
+      - name: Package
+        run: |
+          mapfile -t hits < <(find build -name 'play_libretro.so' -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one play_libretro.so, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          mkdir -p stage
+          strip --strip-all -o stage/play_libretro.so "${hits[0]}"
+          readelf -d stage/play_libretro.so | grep NEEDED
+          (cd stage && zip -q -X ../play_libretro.so.zip play_libretro.so)
+          file stage/play_libretro.so
+          ls -lh play_libretro.so.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: play_libretro.so.zip
+          if-no-files-found: error
+
+  # Both architectures on one Apple Silicon runner, one per job:
+  # CMAKE_OSX_ARCHITECTURES picks the slice. The deployment target (10.15) is
+  # set by the top-level CMakeLists.txt.
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-14
+    strategy:
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_LIBRETRO_CORE=yes -DBUILD_PLAY=off -DBUILD_TESTS=off \
+            -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+          cmake --build build --target play_libretro
+
+      - name: Package
+        run: |
+          lib=play_libretro.dylib
+          hits=()
+          while IFS= read -r f; do hits+=("$f"); done < <(find build -name "$lib" -type f)
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "expected exactly one $lib, found ${#hits[@]}:"
+            printf '  %s\n' "${hits[@]}"
+            exit 1
+          fi
+          lipo -info "${hits[0]}"
+          if [ "$(lipo -archs "${hits[0]}")" != "${{ matrix.arch }}" ]; then
+            echo "$lib is not ${{ matrix.arch }}"
+            exit 1
+          fi
+          otool -L "${hits[0]}"
+          mkdir -p stage
+          cp "${hits[0]}" "stage/$lib"
+          strip -x "stage/$lib"
+          (cd stage && zip -q -X ../play_libretro_${{ matrix.arch }}.dylib.zip "$lib")
+          ls -lh play_libretro_${{ matrix.arch }}.dylib.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: play_libretro_${{ matrix.arch }}.dylib.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [windows, android, linux, macos]
+    if: github.event_name == 'push' || github.event.inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ls -lh dist
+          cat > notes.md <<EOF
+          Play! (PlayStation 2) libretro core built for retroXR, from
+          \`$GITHUB_SHA\`, with \`deps/Framework\` on the \`retroxr\` branch of
+          RetroXR/Play--Framework.
+
+          Windows x86_64 (MSVC), Android arm64-v8a (NDK, stripped), Linux
+          x86_64 and macOS arm64 and x86_64. The source for these binaries is
+          this tag. Play! is BSD-licensed.
+
+          Three fixes over upstream, all of which retroXR needs:
+
+          **The core aborted the frontend on Android.** Upstream sets the data
+          directory to \`getenv("EXTERNAL_STORAGE")\` -- \`/sdcard\` -- where an app
+          without \`MANAGE_EXTERNAL_STORAGE\` cannot create a directory under
+          scoped storage, and the \`std::filesystem_error\` escaped \`retro_init\`.
+          The core now asks the frontend for a directory it manages
+          (\`GET_SAVE_DIRECTORY\`, then \`GET_SYSTEM_DIRECTORY\`) before falling
+          back, and \`retro_init\` no longer lets an exception out.
+
+          **A null JavaVM crashed the PS2VM thread.** \`CJavaVM::AttachCurrentThread\`
+          dereferenced a VM only \`ui_android\`'s \`JNI_OnLoad\` ever sets, which a
+          core the frontend \`dlopen\`s never gets. Attach and detach are now
+          no-ops without a VM.
+
+          **Vertical seams down the picture.** The GS samples a sprite at each
+          pixel's top-left corner, OpenGL at its centre, so the last column of
+          each framebuffer strip was never drawn. \`Prim_Sprite\` now snaps its
+          quad to whole pixels.
+          EOF
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "retroXR Play! (libretro) $TAG" \
+              --notes-file notes.md
+          fi
+          gh release upload "$TAG" \
+            dist/play_libretro.dll.zip \
+            dist/play_libretro_android.so.zip \
+            dist/play_libretro.so.zip \
+            dist/play_libretro_arm64.dylib.zip \
+            dist/play_libretro_x86_64.dylib.zip \
+            --repo "$GITHUB_REPOSITORY" --clobber
