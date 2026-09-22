@@ -152,7 +152,7 @@ jobs:
   # The oldest Ubuntu runner: a shared library loads only against a glibc at
   # least as new as the one it was linked with. The core links libgcc and
   # libstdc++ statically (Source/ui_libretro/CMakeLists.txt) and needs only
-  # libGL and zlib besides libc.
+  # libGL and zlib besides libc. glew includes GL/glu.h, so GLU headers too.
   linux:
     name: Linux x86_64
     runs-on: ubuntu-22.04
@@ -160,7 +160,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build zip libgl-dev zlib1g-dev
+          sudo apt-get install -y ninja-build zip libgl-dev libglu1-mesa-dev zlib1g-dev
 
       - uses: actions/checkout@v6
         with:
